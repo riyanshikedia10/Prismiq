@@ -19,6 +19,7 @@ Jinja2==3.1.6
 jiter==0.13.0
 jsonschema==4.25.1
 jsonschema-specifications==2025.9.1
+kagglehub
 MarkupSafe==3.0.3
 narwhals==2.17.0
 neo4j==5.28.3
