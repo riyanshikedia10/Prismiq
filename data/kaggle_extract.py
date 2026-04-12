@@ -1,305 +1,283 @@
 """
-Approach B: Download and process real-world datasets.
+Approach B — Download and process real-world datasets for ALL roles.
 
-Source 1 — LeetCode company-wise problems from GitHub (no auth needed).
-Source 2 — Data Science job postings + skills from Kaggle (needs kagglehub auth).
+Source 1: LeetCode company-wise problems from GitHub (no auth needed).
+Source 2: Data Science/Analytics/Engineering job postings + skills from Kaggle.
 
-Outputs JSON files to data/processed/ for load_kg.py to consume.
+Outputs role-prefixed JSON files to data/processed/ for load_kg.py.
 """
+
+from __future__ import annotations
 
 import csv
 import io
 import json
+import logging
 import os
 import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pandas as pd
 import requests
 
-# ── Config ───────────────────────────────────────────────────────────────────
-
-GITHUB_BASE = (
-    "https://raw.githubusercontent.com/krishnadey30/"
-    "LeetCode-Questions-CompanyWise/master"
+from config import (
+    ROLES, ROLE_SLUGS, COMPANIES, GITHUB_LEETCODE_BASE, LEETCODE_CSV_MAP,
+    KAGGLE_DATASET, COMPANY_ALIASES, JOB_TITLE_KEYWORDS,
+    LEETCODE_DIFFICULTY_FILTER, SQL_KEYWORDS, setup_logging,
 )
 
-COMPANY_CSV_MAP = {
-    "Google": "google_alltime.csv",
-    "Amazon": "amazon_alltime.csv",
-    "Meta": "facebook_alltime.csv",
-    "Apple": "apple_alltime.csv",
-    "Netflix": None,  # Netflix rarely appears in LeetCode datasets
-}
-
-KAGGLE_DATASET = "asaniczka/data-science-job-postings-and-skills"
-
-FAANG_ALIASES = {
-    "Google": ["google", "alphabet"],
-    "Amazon": ["amazon", "aws"],
-    "Meta": ["meta", "facebook"],
-    "Apple": ["apple"],
-    "Netflix": ["netflix"],
-}
+logger = logging.getLogger(__name__)
 
 TOP_N_PROBLEMS = 25
-
-CODING_ROUND_MAP = {
-    "Google": "Onsite: Coding",
-    "Amazon": "Onsite: SQL Deep Dive",
-    "Meta": "Onsite: Quantitative",
-    "Apple": "Onsite: Coding",
-    "Netflix": "Onsite: SQL & Analysis",
-}
-
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "processed")
 
+_CODING_ROUND: dict[str, dict[str, str]] = {
+    "Data Scientist": {
+        "Google": "Onsite: Coding", "Amazon": "Onsite: SQL Deep Dive",
+        "Meta": "Onsite: Quantitative", "Apple": "Onsite: Coding",
+        "Netflix": "Onsite: SQL & Analysis", "Microsoft": "Onsite: Coding",
+        "Tesla": "Onsite: Coding", "TikTok": "Onsite: Coding", "Uber": "Onsite: Coding",
+    },
+    "Data Analyst": {
+        "Google": "Onsite: SQL & Analysis", "Amazon": "Onsite: SQL & Case Study",
+        "Meta": "Onsite: SQL & Metrics", "Apple": "Onsite: SQL & Business Analysis",
+        "Netflix": "Onsite: SQL & Data Interpretation", "Microsoft": "Onsite: SQL & Analysis",
+        "Tesla": "Onsite: SQL & Reporting", "TikTok": "Onsite: SQL & Metrics",
+        "Uber": "Onsite: SQL & Analysis",
+    },
+    "Data Engineer": {
+        "Google": "Onsite: Coding", "Amazon": "Onsite: Coding",
+        "Meta": "Onsite: Coding 1", "Apple": "Onsite: Coding",
+        "Netflix": "Onsite: Coding & Pipelines", "Microsoft": "Onsite: Coding",
+        "Tesla": "Onsite: Coding", "TikTok": "Onsite: Coding 1", "Uber": "Onsite: Coding",
+    },
+}
 
-# ── Source 1: LeetCode from GitHub ───────────────────────────────────────────
 
-def download_leetcode_data():
-    """Download LeetCode CSVs from GitHub, process top problems per company."""
+def _skills_for_problem(title: str, role: str) -> list[str]:
+    is_sql = any(kw in title.lower() for kw in SQL_KEYWORDS)
+    if is_sql:
+        return ["SQL", "Database Management"]
+    if role == "Data Analyst":
+        return ["Python", "Analytical Thinking"]
+    return ["Python", "Data Structures & Algorithms"]
+
+
+# ── Source 1: LeetCode ───────────────────────────────────────────────────────
+
+def download_leetcode(role: str) -> int:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    slug = ROLE_SLUGS[role]
+    allowed = set(LEETCODE_DIFFICULTY_FILTER.get(role, ["Easy", "Medium", "Hard"]))
+    exp_levels = ["Entry", "Mid"] if role == "Data Analyst" else ["Entry", "Mid", "Senior"]
     total = 0
 
-    for company, csv_file in COMPANY_CSV_MAP.items():
+    for company in COMPANIES:
+        csv_file = LEETCODE_CSV_MAP.get(company)
         if csv_file is None:
-            print(f"  [{company}] No LeetCode CSV available, skipping")
             continue
 
-        url = f"{GITHUB_BASE}/{csv_file}"
-        print(f"  [{company}] Downloading {csv_file}...")
+        url = f"{GITHUB_LEETCODE_BASE}/{csv_file}"
+        logger.info("[%s] Downloading %s", company, csv_file)
 
         try:
             resp = requests.get(url, timeout=30)
             resp.raise_for_status()
-        except requests.RequestException as e:
-            print(f"  [{company}] Download failed: {e}")
+        except requests.RequestException as exc:
+            logger.warning("[%s] Download failed: %s", company, exc)
             continue
 
-        reader = csv.DictReader(io.StringIO(resp.text))
-        rows = list(reader)
-
-        # Sort by frequency (descending) and take top N
+        rows = [
+            r for r in csv.DictReader(io.StringIO(resp.text))
+            if r.get("Difficulty", "").strip() in allowed
+        ]
         for row in rows:
             try:
                 row["_freq"] = float(row.get("Frequency", 0))
             except (ValueError, TypeError):
                 row["_freq"] = 0.0
-
         rows.sort(key=lambda r: r["_freq"], reverse=True)
-        top = rows[:TOP_N_PROBLEMS]
 
         questions = []
-        for i, row in enumerate(top):
+        for i, row in enumerate(rows[:TOP_N_PROBLEMS]):
             title = row.get("Title", "").strip()
-            difficulty = row.get("Difficulty", "Medium").strip()
-            link = row.get("Leetcode Question Link", "").strip()
-            acceptance = row.get("Acceptance", "").strip()
-
             questions.append({
-                "id": f"{company}_LC{i+1}",
+                "id": f"{company}_{slug.upper()}_LC{i + 1}",
                 "text": f"[LeetCode] {title}",
-                "difficulty": difficulty,
+                "difficulty": row.get("Difficulty", "Medium").strip(),
                 "source": "leetcode",
-                "source_url": link,
-                "acceptance": acceptance,
-                "round": CODING_ROUND_MAP.get(company, "Technical Screen"),
-                "skills_tested": ["Python", "Data Structures & Algorithms"],
-                "experience_levels": ["Entry", "Mid", "Senior"],
+                "source_url": row.get("Leetcode Question Link", "").strip(),
+                "acceptance": row.get("Acceptance", "").strip(),
+                "round": _CODING_ROUND.get(role, {}).get(company, "Technical Screen"),
+                "skills_tested": _skills_for_problem(title, role),
+                "experience_levels": exp_levels,
             })
 
-        outpath = os.path.join(OUTPUT_DIR, f"leetcode_{company.lower()}.json")
+        outpath = os.path.join(OUTPUT_DIR, f"{slug}_leetcode_{company.lower()}.json")
         with open(outpath, "w") as f:
-            json.dump({"company": company, "questions": questions}, f, indent=2)
+            json.dump({"company": company, "role": role, "questions": questions}, f, indent=2)
 
-        print(f"  [{company}] Saved {len(questions)} problems → {outpath}")
+        logger.info("[%s] %d problems -> %s", company, len(questions), outpath)
         total += len(questions)
 
-    print(f"\n  LeetCode total: {total} problems across all companies")
+    logger.info("LeetCode total for %s: %d", role, total)
     return total
 
 
-# ── Source 2: Kaggle Job Postings ────────────────────────────────────────────
+# ── Source 2: Kaggle ─────────────────────────────────────────────────────────
 
 def _match_company(name: str) -> str | None:
-    """Check if a company name matches any FAANG alias."""
     if not isinstance(name, str):
         return None
     lower = name.lower().strip()
-    for company, aliases in FAANG_ALIASES.items():
-        for alias in aliases:
-            if alias in lower:
-                return company
+    for company, aliases in COMPANY_ALIASES.items():
+        if any(a in lower for a in aliases):
+            return company
     return None
 
 
-def download_job_skills_data():
-    """Download DS job postings from Kaggle and extract skill frequencies."""
+def _is_role_title(title: str, role: str) -> bool:
+    if not isinstance(title, str):
+        return False
+    lower = title.lower().strip()
+    return any(kw in lower for kw in JOB_TITLE_KEYWORDS.get(role, []))
+
+
+def download_job_skills(role: str) -> int:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    slug = ROLE_SLUGS[role]
 
     try:
         import kagglehub
     except ImportError:
-        print("  [Kaggle] kagglehub not installed — skipping job skills download")
-        print("  [Kaggle] Run: pip install kagglehub")
+        logger.warning("[Kaggle] kagglehub not installed — skipping")
         return 0
 
-    print("  [Kaggle] Downloading job postings dataset...")
+    logger.info("[Kaggle] Downloading dataset for %s...", role)
     try:
         path = kagglehub.dataset_download(KAGGLE_DATASET)
-    except Exception as e:
-        print(f"  [Kaggle] Download failed: {e}")
-        print("  [Kaggle] Make sure ~/.kaggle/kaggle.json exists or set")
-        print("           KAGGLE_USERNAME and KAGGLE_KEY in your .env")
+    except Exception as exc:
+        logger.warning("[Kaggle] Download failed: %s", exc)
         return 0
 
-    print(f"  [Kaggle] Dataset at: {path}")
-
-    # Find CSV files
     postings_path = os.path.join(path, "job_postings.csv")
     skills_path = os.path.join(path, "job_skills.csv")
 
     if not os.path.exists(postings_path) or not os.path.exists(skills_path):
-        # Try to locate the files anywhere under the download path
-        for root, _dirs, files in os.walk(path):
+        for root, _, files in os.walk(path):
             for fname in files:
                 if fname == "job_postings.csv":
                     postings_path = os.path.join(root, fname)
                 elif fname == "job_skills.csv":
                     skills_path = os.path.join(root, fname)
 
-    if not os.path.exists(postings_path):
-        print(f"  [Kaggle] job_postings.csv not found under {path}")
-        return 0
-    if not os.path.exists(skills_path):
-        print(f"  [Kaggle] job_skills.csv not found under {path}")
+    if not os.path.exists(postings_path) or not os.path.exists(skills_path):
+        logger.warning("[Kaggle] CSVs not found under %s", path)
         return 0
 
     postings_df = pd.read_csv(postings_path)
     skills_df = pd.read_csv(skills_path)
+    logger.info("[Kaggle] %d postings, %d skill entries", len(postings_df), len(skills_df))
 
-    print(f"  [Kaggle] Loaded {len(postings_df)} postings, {len(skills_df)} skill entries")
-
-    # Identify the company column (could be 'company' or 'company_name')
-    company_col = None
-    for col in ["company", "company_name"]:
-        if col in postings_df.columns:
-            company_col = col
-            break
-
-    if company_col is None:
-        print(f"  [Kaggle] No company column found. Columns: {list(postings_df.columns)}")
+    company_col = next((c for c in ("company", "company_name") if c in postings_df.columns), None)
+    title_col = next((c for c in ("title", "job_title", "job_name") if c in postings_df.columns), None)
+    if not company_col or not title_col:
+        logger.warning("[Kaggle] Missing columns. Have: %s", list(postings_df.columns))
         return 0
 
-    # Map companies to FAANG
-    postings_df["faang"] = postings_df[company_col].apply(_match_company)
-    faang_postings = postings_df[postings_df["faang"].notna()]
-    print(f"  [Kaggle] {len(faang_postings)} FAANG postings found")
+    postings_df["_co"] = postings_df[company_col].apply(_match_company)
+    postings_df["_role"] = postings_df[title_col].apply(lambda t: _is_role_title(t, role))
+    filtered = postings_df[(postings_df["_co"].notna()) & (postings_df["_role"])]
+    logger.info("[Kaggle] %d matched postings", len(filtered))
 
-    if faang_postings.empty:
-        print("  [Kaggle] No FAANG postings matched — saving empty files")
-        for company in FAANG_ALIASES:
-            outpath = os.path.join(OUTPUT_DIR, f"job_skills_{company.lower()}.json")
-            with open(outpath, "w") as f:
-                json.dump({"company": company, "skills": []}, f, indent=2)
+    if filtered.empty:
+        for co in COMPANIES:
+            _write_empty_skills(slug, co, role)
         return 0
 
-    # Join skills with FAANG postings
-    join_col = None
-    for col in ["job_link", "job_id", "id"]:
-        if col in postings_df.columns and col in skills_df.columns:
-            join_col = col
-            break
-
-    if join_col is None:
-        # Try matching on index or first common column
+    join_col = next(
+        (c for c in ("job_link", "job_id", "id") if c in postings_df.columns and c in skills_df.columns),
+        None,
+    )
+    if not join_col:
         common = set(postings_df.columns) & set(skills_df.columns)
-        if common:
-            join_col = list(common)[0]
-        else:
-            print(f"  [Kaggle] No common join column between postings and skills")
-            return 0
+        join_col = next(iter(common), None)
+    if not join_col:
+        logger.warning("[Kaggle] No join column")
+        return 0
 
-    merged = faang_postings.merge(skills_df, on=join_col, how="inner")
-
-    # Identify skill column
-    skill_col = None
-    for col in ["skill", "skill_name", "skills"]:
-        if col in merged.columns:
-            skill_col = col
-            break
-
-    if skill_col is None:
-        # Use any column from skills_df that isn't the join column
-        skill_candidates = [c for c in skills_df.columns if c != join_col]
-        if skill_candidates:
-            skill_col = skill_candidates[0]
-        else:
-            print(f"  [Kaggle] No skill column identified")
-            return 0
+    merged = filtered.merge(skills_df, on=join_col, how="inner")
+    skill_col = next((c for c in ("skill", "skill_name", "skills") if c in merged.columns), None)
+    if not skill_col:
+        cands = [c for c in skills_df.columns if c != join_col]
+        skill_col = cands[0] if cands else None
+    if not skill_col:
+        logger.warning("[Kaggle] No skill column")
+        return 0
 
     total = 0
-    for company in FAANG_ALIASES:
-        company_skills = merged[merged["faang"] == company]
-        if company_skills.empty:
-            outpath = os.path.join(OUTPUT_DIR, f"job_skills_{company.lower()}.json")
-            with open(outpath, "w") as f:
-                json.dump({"company": company, "skills": []}, f, indent=2)
+    for co in COMPANIES:
+        sub = merged[merged["_co"] == co]
+        if sub.empty:
+            _write_empty_skills(slug, co, role)
             continue
 
-        # Count skill frequencies
-        freq = company_skills[skill_col].value_counts()
-
+        freq = sub[skill_col].value_counts()
         skills = []
-        for rank, (skill_name, count) in enumerate(freq.items()):
-            if not isinstance(skill_name, str) or not skill_name.strip():
+        for rank, (name, count) in enumerate(freq.items()):
+            if not isinstance(name, str) or not name.strip():
                 continue
-
-            # Assign importance by rank
             if rank < len(freq) * 0.2:
-                importance = "Critical"
+                imp = "Critical"
             elif rank < len(freq) * 0.5:
-                importance = "High"
+                imp = "High"
             else:
-                importance = "Medium"
+                imp = "Medium"
+            skills.append({"name": name.strip(), "importance": imp,
+                           "category": "Technical", "source": "kaggle_job_postings",
+                           "frequency": int(count)})
 
-            skills.append({
-                "name": skill_name.strip(),
-                "importance": importance,
-                "category": "Technical",
-                "source": "kaggle_job_postings",
-                "frequency": int(count),
-            })
-
-        outpath = os.path.join(OUTPUT_DIR, f"job_skills_{company.lower()}.json")
+        outpath = os.path.join(OUTPUT_DIR, f"{slug}_job_skills_{co.lower()}.json")
         with open(outpath, "w") as f:
-            json.dump({"company": company, "skills": skills}, f, indent=2)
-
-        print(f"  [{company}] {len(skills)} verified skills → {outpath}")
+            json.dump({"company": co, "role": role, "skills": skills}, f, indent=2)
+        logger.info("[%s] %d skills -> %s", co, len(skills), outpath)
         total += len(skills)
 
-    print(f"\n  Kaggle total: {total} verified skills across all companies")
+    logger.info("Kaggle total for %s: %d", role, total)
     return total
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+def _write_empty_skills(slug: str, company: str, role: str) -> None:
+    outpath = os.path.join(OUTPUT_DIR, f"{slug}_job_skills_{company.lower()}.json")
+    with open(outpath, "w") as f:
+        json.dump({"company": company, "role": role, "skills": []}, f, indent=2)
 
-def extract_all():
-    """Run both data sources. LeetCode always runs; Kaggle gracefully degrades."""
-    print("=" * 50)
-    print("Approach B: Real-World Dataset Extraction")
-    print("=" * 50)
 
-    print("\n--- Source 1: LeetCode (GitHub) ---")
-    lc_count = download_leetcode_data()
+# ── CLI ──────────────────────────────────────────────────────────────────────
 
-    print("\n--- Source 2: Job Postings (Kaggle) ---")
-    jk_count = download_job_skills_data()
+def extract_role(role: str) -> None:
+    logger.info("=" * 60)
+    logger.info("Approach B: %s (%s)", role, ROLE_SLUGS[role])
+    logger.info("=" * 60)
+    download_leetcode(role)
+    download_job_skills(role)
 
-    print(f"\n{'=' * 50}")
-    print(f"Done. LeetCode: {lc_count} problems, Kaggle: {jk_count} skills")
-    print(f"{'=' * 50}")
+
+def extract_all() -> None:
+    for role in ROLES:
+        extract_role(role)
 
 
 if __name__ == "__main__":
-    extract_all()
+    import argparse
+
+    setup_logging()
+    parser = argparse.ArgumentParser(description="Approach B: real-world dataset extraction")
+    parser.add_argument("--role", choices=ROLES, help="Single role")
+    args = parser.parse_args()
+
+    if args.role:
+        extract_role(args.role)
+    else:
+        extract_all()
