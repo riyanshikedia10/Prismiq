@@ -1,8 +1,7 @@
 """
 Knowledge Graph retrieval functions for the RAG pipeline.
-All queries accept a `role` parameter to scope results to the correct
-interview rounds, skills, and questions for the selected role.
-Uses read transactions for safety.
+Uses NEEDS relationship (not REQUIRES) for skills.
+Full flow: Company -[HAS_ROUND]-> Round -[CONTAINS]-> Question -[TESTS]-> Skill
 """
 
 from __future__ import annotations
@@ -39,18 +38,39 @@ def get_company_overview(driver: Driver, company: str, role: str = "Data Scienti
                 co=company, pfx=pfx,
             )
         ]
+        # Use NEEDS relationship (populated from seed frequency)
         skills = [
             dict(r) for r in session.run(
                 """
-                MATCH (c:Company {name: $co})-[req:REQUIRES]->(s:Skill)
-                WHERE req.role = $role
-                RETURN s.name AS name, req.importance AS importance, s.category AS category
-                ORDER BY CASE req.importance
+                MATCH (c:Company {name: $co})-[n:NEEDS]->(s:Skill)
+                WHERE n.role = $role
+                RETURN s.name AS name, n.importance AS importance,
+                       coalesce(s.category, 'Technical') AS category
+                ORDER BY CASE n.importance
                   WHEN 'Critical' THEN 1 WHEN 'High' THEN 2 WHEN 'Medium' THEN 3 ELSE 4 END
                 """,
                 co=company, role=role,
             )
         ]
+        # Fallback: derive from round seed data if NEEDS is empty
+        if not skills:
+            skills = [
+                dict(r) for r in session.run(
+                    """
+                    MATCH (c:Company {name: $co})-[:HAS_ROUND]->(ir:InterviewRound)
+                    WHERE ir.id STARTS WITH $pfx
+                    UNWIND ir.skills_tested AS skill_name
+                    WITH skill_name, count(ir) AS freq
+                    RETURN DISTINCT skill_name AS name,
+                           CASE WHEN freq >= 3 THEN 'Critical'
+                                WHEN freq = 2  THEN 'High'
+                                ELSE 'Medium' END AS importance,
+                           'Technical' AS category
+                    ORDER BY freq DESC
+                    """,
+                    co=company, pfx=pfx,
+                )
+            ]
     return {"company": company, "role": role, "rounds": rounds, "skills": skills}
 
 
@@ -61,7 +81,6 @@ def get_round_details(
 ) -> dict[str, Any]:
     rid = f"{_prefix(company, role)}_{round_name}".replace(" ", "_")
     with driver.session() as session:
-        # Get the round's own skills_tested (from seed data)
         round_record = session.run(
             "MATCH (ir:InterviewRound {id: $rid}) RETURN ir.skills_tested AS seed_skills",
             rid=rid,
@@ -76,12 +95,12 @@ def get_round_details(
                 RETURN iq.text AS question, iq.difficulty AS difficulty,
                        iq.source AS source, iq.source_url AS source_url,
                        collect(DISTINCT s.name) AS skills_tested
+                LIMIT 20
                 """,
                 rid=rid,
             )
         ]
 
-        # Prefer seed skills; fall back to skills derived from questions
         if seed_skills:
             skills = [{"skill": s, "category": "seed"} for s in seed_skills]
         else:
@@ -89,7 +108,7 @@ def get_round_details(
                 dict(r) for r in session.run(
                     """
                     MATCH (ir:InterviewRound {id: $rid})-[:CONTAINS]->(iq)-[:TESTS]->(s:Skill)
-                    RETURN DISTINCT s.name AS skill, s.category AS category
+                    RETURN DISTINCT s.name AS skill, coalesce(s.category,'Technical') AS category
                     """,
                     rid=rid,
                 )
@@ -105,22 +124,42 @@ def get_questions_by_level(
 ) -> list[dict[str, Any]]:
     pfx = _prefix(company, role)
     with driver.session() as session:
-        return [
+        # Primary: company-specific via rounds
+        results = [
             dict(r) for r in session.run(
                 """
                 MATCH (c:Company {name: $co})-[:HAS_ROUND]->(ir:InterviewRound)
-                      -[:CONTAINS]->(iq:InterviewQuestion)-[:FOR_LEVEL]->(el:ExperienceLevel {level: $lv})
+                      -[:CONTAINS]->(iq:InterviewQuestion)
                 WHERE ir.id STARTS WITH $pfx
                 OPTIONAL MATCH (iq)-[:TESTS]->(s:Skill)
+                OPTIONAL MATCH (iq)-[:FOR_LEVEL]->(el:ExperienceLevel)
                 RETURN ir.name AS round_name, ir.order AS round_order,
                        iq.text AS question, iq.difficulty AS difficulty,
                        iq.source AS source, iq.source_url AS source_url,
                        collect(DISTINCT s.name) AS skills_tested
                 ORDER BY ir.order
+                LIMIT 30
                 """,
-                co=company, lv=experience_level, pfx=pfx,
+                co=company, pfx=pfx,
             )
         ]
+        # Fallback: any question for this role
+        if not results:
+            results = [
+                dict(r) for r in session.run(
+                    """
+                    MATCH (iq:InterviewQuestion {role: $role})
+                    OPTIONAL MATCH (iq)-[:TESTS]->(s:Skill)
+                    RETURN 'General' AS round_name, 1 AS round_order,
+                           iq.text AS question, iq.difficulty AS difficulty,
+                           iq.source AS source, '' AS source_url,
+                           collect(DISTINCT s.name) AS skills_tested
+                    LIMIT 20
+                    """,
+                    role=role,
+                )
+            ]
+        return results
 
 
 # ── Skill resources ──────────────────────────────────────────────────────────
@@ -176,7 +215,7 @@ def get_all_rounds(driver: Driver, company: str, role: str = "Data Scientist") -
         ]
 
 
-# ── RAG context assembly ────────────────────────────────────────────────────
+# ── RAG context assembly ─────────────────────────────────────────────────────
 
 def get_context_for_generation(
     driver: Driver,
@@ -192,7 +231,7 @@ def get_context_for_generation(
 
     resources: dict[str, list] = {}
     for skill in overview["skills"]:
-        if skill["importance"] in ("Critical", "High"):
+        if skill.get("importance") in ("Critical", "High"):
             sr = get_skill_resources(driver, skill["name"])
             if sr:
                 resources[skill["name"]] = sr
