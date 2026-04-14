@@ -553,11 +553,11 @@ SEED_DATA = {
 }
 
 
-def get_seed(role: str, company: str) -> dict | None:
+def get_seed(role: str, company: str):
     """Return seed data for a (role, company) pair, or None if not available."""
     return SEED_DATA.get(role, {}).get(company)
 
 
-def get_companies_for_role(role: str) -> list[str]:
+def get_companies_for_role(role: str):
     """Return all companies that have seed data for a given role."""
     return list(SEED_DATA.get(role, {}).keys())
