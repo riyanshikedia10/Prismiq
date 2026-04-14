@@ -42,7 +42,7 @@ FAANG_ALIASES = {
 }
 
 # Data Analyst interviews focus on SQL, Excel, case studies — not heavy DSA
-TOP_N_PROBLEMS = 25
+TOP_N_PROBLEMS = 50
 
 # DA-specific interview round mapping
 INTERVIEW_ROUND_MAP = {
