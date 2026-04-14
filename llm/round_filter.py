@@ -21,6 +21,9 @@ from models import LLMError
 
 logger = logging.getLogger(__name__)
 
+# Cache to ensure consistent filtering within a session
+_filter_cache: dict[str, set[str]] = {}
+
 _SYSTEM_PROMPT = (
     "You are an expert on tech company hiring processes. You have deep knowledge "
     "of interview structures at Google, Amazon, Meta, Apple, Netflix, Microsoft, "
@@ -87,9 +90,17 @@ def filter_rounds_by_level(
     if not rounds:
         return rounds
 
+    # Check cache first — cache stores round NAMES only, then filter from input
+    cache_key = f"{company}|{role}|{experience_level}"
+    if cache_key in _filter_cache:
+        logger.debug("Cache hit for %s", cache_key)
+        cached_names = _filter_cache[cache_key]
+        return [r for r in rounds if r["name"] in cached_names]
+
     # Mid and Senior always get all rounds — no API call needed
     if experience_level in ("Mid", "Senior"):
         logger.debug("Level=%s -> returning all %d rounds", experience_level, len(rounds))
+        _filter_cache[cache_key] = {r["name"] for r in rounds}
         return rounds
 
     from config import get_settings
@@ -141,6 +152,7 @@ def filter_rounds_by_level(
             company, role, experience_level, len(rounds), len(filtered), reasoning,
         )
 
+        _filter_cache[cache_key] = {r["name"] for r in filtered}
         return filtered
 
     except Exception:
