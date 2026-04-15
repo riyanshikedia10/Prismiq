@@ -30,6 +30,7 @@ from kg.kg_chat import route_query
 from llm.chat import answer_from_kg
 from llm.generator import generate_question
 from llm.evaluator import evaluate_answer, explain_reasoning_path
+from llm.round_filter import filter_rounds_by_level
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -105,10 +106,16 @@ def _dashboard(driver, company, role, experience):
 
     overview = get_company_overview(driver, company, role)
 
-    st.markdown("### Interview Rounds")
-    if overview["rounds"]:
-        cols = st.columns(min(len(overview["rounds"]), 3))
-        for i, r in enumerate(overview["rounds"]):
+    # Filter rounds by experience level using LLM
+    filtered_rounds = filter_rounds_by_level(company, role, experience, overview["rounds"])
+    # Re-number rounds sequentially after filtering
+    for idx, r in enumerate(filtered_rounds, 1):
+        r["round_order"] = idx
+
+    st.markdown(f"### Interview Rounds ({len(filtered_rounds)} for {experience} level)")
+    if filtered_rounds:
+        cols = st.columns(min(len(filtered_rounds), 3))
+        for i, r in enumerate(filtered_rounds):
             with cols[i % len(cols)]:
                 color = COMPANY_COLORS.get(company, "#4285F4")
                 st.markdown(
@@ -137,7 +144,7 @@ def _dashboard(driver, company, role, experience):
     st.markdown("### Quick Stats")
     questions = get_questions_by_level(driver, company, experience, role)
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Rounds",                   len(overview["rounds"]))
+    m1.metric("Rounds",                   len(filtered_rounds))
     m2.metric("Skills",                   len(overview["skills"]))
     m3.metric(f"Questions ({experience})", len(questions))
     m4.metric("Critical Skills",           len(critical))
@@ -149,8 +156,9 @@ def _practice(driver, company, role, experience):
     st.markdown(f'<div class="main-header">Practice Mode — {role}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="sub-header">{company} / {role} / {experience}</div>', unsafe_allow_html=True)
 
-    rounds   = get_all_rounds(driver, company, role)
-    names    = ["Random"] + [r["name"] for r in rounds]
+    all_rounds = get_all_rounds(driver, company, role)
+    rounds     = filter_rounds_by_level(company, role, experience, all_rounds)
+    names      = ["Random"] + [r["name"] for r in rounds]
     selected = st.selectbox("Interview Round", names)
     actual   = random.choice([r["name"] for r in rounds]) if selected == "Random" and rounds else selected
 
