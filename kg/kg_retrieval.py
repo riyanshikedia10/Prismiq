@@ -61,7 +61,7 @@ def get_company_overview(driver: Driver, company: str, role: str = "Data Scienti
                     WHERE ir.id STARTS WITH $pfx
                     UNWIND ir.skills_tested AS skill_name
                     WITH skill_name, count(ir) AS freq
-                    RETURN DISTINCT skill_name AS name,
+                    RETURN skill_name AS name,
                            CASE WHEN freq >= 3 THEN 'Critical'
                                 WHEN freq = 2  THEN 'High'
                                 ELSE 'Medium' END AS importance,

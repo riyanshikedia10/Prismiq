@@ -5,14 +5,15 @@ No GPT-generated content. GPT is used only at runtime (generator + evaluator).
 Data sources loaded:
   1. Seed round structures (hand-verified from Glassdoor/Blind) — llm/seeds.py
   2. LeetCode problems (GitHub CSVs) — data/processed/{slug}_leetcode_{company}.json
-  3. Kaggle job skills (allowlisted technical skills only) — data/processed/job_market_skills.json
+  3. Kaggle job skills (ALL unique skills, graph-classified) — data/processed/job_market_skills.json
   4. GitHub interview questions — data/processed/github_{ds,de}_questions.json
   5. Curated learning resources — data/resources.py
 
 Skill importance hierarchy:
   - Critical: company+role specific tech stack (from CRITICAL_BY_COMPANY_ROLE)
+  - High:     appears in 2+ rounds or 3+ companies in Kaggle data
   - Medium:   appears in 1 round, or is a soft/behavioral skill
-  - Kaggle:   only adds Skill nodes via Role-level NEEDS, never Company-level
+  - Kaggle:   loads ALL unique skills; graph-native Cypher classifies importance
 """
 
 from __future__ import annotations
@@ -161,18 +162,50 @@ CRITICAL_BY_COMPANY_ROLE: dict[tuple[str, str], set[str]] = {
     },
 }
 
-# Kaggle allowlist — only well-known technical skills are trusted from job postings
-KAGGLE_TECHNICAL_ALLOWLIST = {
-    "Python", "SQL", "R", "Scala", "Java",
-    "Spark", "Kafka", "Airflow", "dbt", "Flink",
-    "Tableau", "Power BI", "Looker", "Excel",
-    "AWS", "GCP", "Azure", "Snowflake", "Databricks",
-    "TensorFlow", "PyTorch", "Scikit-learn", "Pandas", "NumPy",
-    "Machine Learning", "Deep Learning", "Statistics",
-    "A/B Testing", "Data Modeling", "Data Pipelines",
-    "Kubernetes", "Docker", "Redshift", "BigQuery",
-    "Data Visualization", "SAS", "Matlab",
+# Minimal noise filter — skip obviously invalid entries, NOT a whitelist.
+# All other skills are loaded; the graph classifies importance via Cypher.
+NOISE_SKILLS = {
+    # Generic filler from job postings
+    "n/a", "none", "other", "various", "etc", "tbd", "na", "null",
 }
+
+# Keep the old name as an alias for backward compatibility (tests/app may reference it)
+KAGGLE_TECHNICAL_ALLOWLIST = None  # DEPRECATED — all skills are now loaded
+
+
+def _normalize_skill_name(raw: str) -> str | None:
+    """
+    Normalize a raw skill string from Kaggle data.
+    Returns None if the skill should be skipped (noise/invalid).
+    Applies title-case normalization to prevent duplicates like
+    'Leadership Principles' vs 'leadership principles'.
+    """
+    name = raw.strip()
+    if not name:
+        return None
+    if name.lower() in NOISE_SKILLS:
+        return None
+    # Skip purely numeric entries
+    if name.replace(".", "").replace("-", "").isdigit():
+        return None
+    # Allow single uppercase letters (R, C) but reject lowercase single chars
+    if len(name) == 1 and not name.isupper():
+        return None
+    # Normalize casing: title case, but preserve known acronyms and compounds
+    _ACRONYMS = {"sql", "aws", "gcp", "etl", "api", "ci", "cd", "ml",
+                 "ai", "nlp", "sas", "cdc", "bi", "iot", "llm"}
+    words = name.split()
+    normalized = []
+    for w in words:
+        if w.lower() in _ACRONYMS:
+            normalized.append(w.upper())
+        elif "/" in w or w.isupper() and len(w) > 1:
+            normalized.append(w)  # keep A/B, HTTP, etc. as-is
+        elif w.startswith("("):
+            normalized.append(w)
+        else:
+            normalized.append(w.capitalize())
+    return " ".join(normalized)
 
 # Topic to round name mapping (must match seed round names exactly)
 TOPIC_TO_ROUND: dict[str, str] = {
@@ -329,10 +362,19 @@ def _load_seed_rounds(session) -> None:
     )
 
 
+BATCH_SIZE = 500  # rows per UNWIND batch — balances speed vs memory on cloud Neo4j
+
+
 # ── 3. LeetCode problems ──────────────────────────────────────────────────────
 
 def _load_leetcode(session) -> None:
+    # ── Collect all data first ────────────────────────────────────────────
+    q_batch: list[dict] = []
+    round_links: list[dict] = []
+    skill_links: list[dict] = []
+    level_links: list[dict] = []
     total = 0
+
     for role in ROLES:
         slug = ROLE_SLUGS[role]
         for company in COMPANIES:
@@ -344,58 +386,88 @@ def _load_leetcode(session) -> None:
 
             prefix = f"{company}_{slug}"
             for q in data.get("questions", []):
-                q_id       = q.get("id", f"{prefix}_LC{total}")
+                q_id = q.get("id", f"{prefix}_LC{total}")
                 round_name = q.get("round", "Technical Screen")
-                round_id   = f"{prefix}_{round_name}".replace(" ", "_")
+                round_id = f"{prefix}_{round_name}".replace(" ", "_")
 
-                session.run(
-                    """
-                    MERGE (iq:InterviewQuestion {id: $id})
-                      ON CREATE SET iq.text       = $text,
-                                    iq.difficulty = $diff,
-                                    iq.round_name = $rname,
-                                    iq.source     = $src,
-                                    iq.source_url = $url,
-                                    iq.acceptance = $acc,
-                                    iq.role       = $role
-                    """,
-                    id=q_id, text=q["text"], diff=q.get("difficulty", "Medium"),
-                    rname=round_name, src="leetcode",
-                    url=q.get("source_url", ""), acc=q.get("acceptance", ""),
-                    role=role,
-                )
-                session.run(
-                    """
-                    MATCH (ir:InterviewRound {id: $rid}), (iq:InterviewQuestion {id: $qid})
-                    MERGE (ir)-[:CONTAINS]->(iq)
-                    """,
-                    rid=round_id, qid=q_id,
-                )
+                q_batch.append({
+                    "id": q_id, "text": q["text"],
+                    "diff": q.get("difficulty", "Medium"),
+                    "rname": round_name, "src": "leetcode",
+                    "url": q.get("source_url", ""),
+                    "acc": q.get("acceptance", ""), "role": role,
+                })
+                round_links.append({"rid": round_id, "qid": q_id})
+
                 for sk in q.get("skills_tested", []):
-                    session.run("MERGE (s:Skill {name: $s})", s=sk)
-                    session.run(
-                        """
-                        MATCH (iq:InterviewQuestion {id: $qid}), (s:Skill {name: $s})
-                        MERGE (iq)-[:TESTS]->(s)
-                        """,
-                        qid=q_id, s=sk,
-                    )
+                    skill_links.append({"qid": q_id, "skill": sk})
                 for lv in q.get("experience_levels", EXPERIENCE_LEVELS):
-                    session.run(
-                        """
-                        MATCH (iq:InterviewQuestion {id: $qid}), (el:ExperienceLevel {level: $lv})
-                        MERGE (iq)-[:FOR_LEVEL]->(el)
-                        """,
-                        qid=q_id, lv=lv,
-                    )
+                    level_links.append({"qid": q_id, "level": lv})
+
                 total += 1
+
+    if not q_batch:
+        logger.info("[LeetCode] 0 problems loaded (source: GitHub CSV)")
+        return
+
+    # ── Batch load ────────────────────────────────────────────────────────
+    for i in range(0, len(q_batch), BATCH_SIZE):
+        session.run(
+            """
+            UNWIND $batch AS q
+            MERGE (iq:InterviewQuestion {id: q.id})
+              ON CREATE SET iq.text = q.text, iq.difficulty = q.diff,
+                            iq.round_name = q.rname, iq.source = q.src,
+                            iq.source_url = q.url, iq.acceptance = q.acc,
+                            iq.role = q.role
+            """,
+            batch=q_batch[i : i + BATCH_SIZE],
+        )
+    for i in range(0, len(round_links), BATCH_SIZE):
+        session.run(
+            """
+            UNWIND $batch AS rl
+            MATCH (ir:InterviewRound {id: rl.rid}), (iq:InterviewQuestion {id: rl.qid})
+            MERGE (ir)-[:CONTAINS]->(iq)
+            """,
+            batch=round_links[i : i + BATCH_SIZE],
+        )
+    unique_skills = list({sl["skill"] for sl in skill_links})
+    if unique_skills:
+        session.run("UNWIND $names AS n MERGE (s:Skill {name: n})", names=unique_skills)
+    for i in range(0, len(skill_links), BATCH_SIZE):
+        session.run(
+            """
+            UNWIND $batch AS sl
+            MATCH (iq:InterviewQuestion {id: sl.qid}), (s:Skill {name: sl.skill})
+            MERGE (iq)-[:TESTS]->(s)
+            """,
+            batch=skill_links[i : i + BATCH_SIZE],
+        )
+    for i in range(0, len(level_links), BATCH_SIZE):
+        session.run(
+            """
+            UNWIND $batch AS ll
+            MATCH (iq:InterviewQuestion {id: ll.qid}), (el:ExperienceLevel {level: ll.level})
+            MERGE (iq)-[:FOR_LEVEL]->(el)
+            """,
+            batch=level_links[i : i + BATCH_SIZE],
+        )
 
     logger.info("[LeetCode] %d problems loaded (source: GitHub CSV)", total)
 
 
-# ── 4. Kaggle job market skills (allowlisted technical only) ──────────────────
+# ── 4. Kaggle job market skills (ALL unique skills, graph-classified) ─────────
+
 
 def _load_job_market_skills(session) -> None:
+    """
+    Load ALL unique skills from Kaggle job postings into the KG.
+    Uses batched UNWIND for performance on cloud Neo4j instances.
+    Deduplicates by normalized name per role, stores frequency,
+    and links to companies when the data supports it.
+    Graph-native classification happens in _classify_kaggle_skills().
+    """
     path = "data/processed/job_market_skills.json"
     if not os.path.exists(path):
         logger.warning("[Kaggle Skills] %s not found — skipping", path)
@@ -404,47 +476,164 @@ def _load_job_market_skills(session) -> None:
     with open(path) as f:
         data = json.load(f)
 
-    total   = 0
+    # ── Phase 1: Collect and deduplicate in Python ────────────────────────
+    skill_batch: list[dict] = []          # for Skill nodes + Role links
+    company_batch: list[dict] = []        # for Company-level NEEDS
+    total = 0
     skipped = 0
 
     for role, skills in data.items():
-        seen_skills: set[str] = set()
+        seen: set[str] = set()
         for skill in skills:
-            skill_name = skill["name"].strip()
-
-            # Only load skills in the technical allowlist — skip all noise
-            if skill_name not in KAGGLE_TECHNICAL_ALLOWLIST:
+            name = _normalize_skill_name(skill.get("name", ""))
+            if name is None:
                 skipped += 1
                 continue
 
-            # Deduplicate within role
-            if skill_name in seen_skills:
+            key = name.lower()
+            if key in seen:
                 continue
-            seen_skills.add(skill_name)
+            seen.add(key)
 
-            # Create Skill node
-            session.run(
-                """
-                MERGE (s:Skill {name: $name})
-                ON CREATE SET s.category = 'Technical', s.source = 'kaggle'
-                """,
-                name=skill_name,
-            )
+            freq = skill.get("frequency", 1)
+            companies = skill.get("companies", [])
 
-            # Link to Role only — seed data owns Company-level NEEDS
-            session.run(
-                """
-                MATCH (r:Role {name: $role}), (s:Skill {name: $sk})
-                MERGE (r)-[:NEEDS]->(s)
-                """,
-                role=role, sk=skill_name,
-            )
+            skill_batch.append({
+                "name": name,
+                "freq": freq,
+                "role": role,
+            })
+
+            for co in companies:
+                if co in COMPANIES:
+                    company_batch.append({
+                        "name": name,
+                        "freq": freq,
+                        "role": role,
+                        "company": co,
+                    })
+
             total += 1
 
     logger.info(
-        "[Kaggle Skills] %d skills loaded, %d skipped (not in technical allowlist)",
+        "[Kaggle Skills] Collected %d unique skills, %d noise skipped. Loading in batches...",
         total, skipped,
     )
+
+    # ── Phase 2: Batch-load Skill nodes + Role-NEEDS via UNWIND ──────────
+    for i in range(0, len(skill_batch), BATCH_SIZE):
+        batch = skill_batch[i : i + BATCH_SIZE]
+        session.run(
+            """
+            UNWIND $batch AS sk
+            MERGE (s:Skill {name: sk.name})
+            ON CREATE SET s.source      = 'kaggle',
+                          s.kaggle_freq = sk.freq
+            ON MATCH SET  s.kaggle_freq = coalesce(s.kaggle_freq, 0) + sk.freq
+            WITH sk, s
+            MATCH (r:Role {name: sk.role})
+            MERGE (r)-[n:NEEDS]->(s)
+            ON CREATE SET n.frequency = sk.freq, n.source = 'kaggle'
+            ON MATCH SET  n.frequency = coalesce(n.frequency, 0) + sk.freq
+            """,
+            batch=batch,
+        )
+
+    # ── Phase 3: Batch-load Company-NEEDS via UNWIND ─────────────────────
+    for i in range(0, len(company_batch), BATCH_SIZE):
+        batch = company_batch[i : i + BATCH_SIZE]
+        session.run(
+            """
+            UNWIND $batch AS sk
+            MATCH (c:Company {name: sk.company}), (s:Skill {name: sk.name})
+            MERGE (c)-[n:NEEDS {role: sk.role}]->(s)
+            ON CREATE SET n.importance = 'Medium',
+                          n.source    = 'kaggle',
+                          n.frequency = sk.freq
+            """,
+            batch=batch,
+        )
+
+    logger.info(
+        "[Kaggle Skills] %d unique skills loaded, %d company links created",
+        total, len(company_batch),
+    )
+
+
+def _classify_kaggle_skills(session) -> None:
+    """
+    Graph-native skill classification using Cypher.
+    Runs AFTER all data is loaded so the graph structure drives importance.
+    Promotes skills based on cross-company frequency regardless of source.
+    """
+    # Promote skills appearing across 3+ companies (any source) to High
+    result = session.run(
+        """
+        MATCH (c:Company)-[n:NEEDS]->(s:Skill)
+        WHERE n.importance = 'Medium'
+        WITH s, collect(n) AS rels, count(DISTINCT c) AS company_count
+        WHERE company_count >= 3
+        FOREACH (r IN rels | SET r.importance = 'High')
+        RETURN size(rels) AS promoted
+        """
+    ).single()
+    promoted_cross = result["promoted"] if result else 0
+
+    # Tag high-frequency Kaggle skills as Technical
+    result = session.run(
+        """
+        MATCH (r:Role)-[n:NEEDS]->(s:Skill)
+        WHERE n.frequency >= 50
+        SET s.category = 'Technical'
+        RETURN count(n) AS tagged
+        """
+    ).single()
+    tagged_technical = result["tagged"] if result else 0
+
+    # Tag low-frequency Kaggle-only skills as Supplementary
+    result = session.run(
+        """
+        MATCH (s:Skill)
+        WHERE s.source = 'kaggle'
+          AND NOT (:Company)-[:NEEDS {source: 'seed'}]->(s)
+          AND coalesce(s.kaggle_freq, 0) < 10
+        SET s.category = 'Supplementary'
+        RETURN count(s) AS supplementary
+        """
+    ).single()
+    supplementary = result["supplementary"] if result else 0
+
+    logger.info(
+        "[Kaggle Classification] %d promoted to High (3+ companies), "
+        "%d tagged Technical (freq>=50), %d tagged Supplementary (freq<10)",
+        promoted_cross, tagged_technical, supplementary,
+    )
+
+    # Merge case-insensitive duplicates: keep the title-case version,
+    # re-link all relationships from the duplicate to the canonical node
+    result = session.run(
+        """
+        MATCH (s:Skill)
+        WITH toLower(s.name) AS key, collect(s) AS dupes
+        WHERE size(dupes) > 1
+        WITH dupes, head(dupes) AS keep
+        UNWIND tail(dupes) AS remove
+        OPTIONAL MATCH (remove)<-[r_in]-()
+        OPTIONAL MATCH (remove)-[r_out]->()
+        WITH keep, remove, collect(DISTINCT r_in) AS ins, collect(DISTINCT r_out) AS outs
+        FOREACH (r IN ins |
+            DELETE r
+        )
+        FOREACH (r IN outs |
+            DELETE r
+        )
+        DETACH DELETE remove
+        RETURN count(remove) AS merged
+        """
+    ).single()
+    merged = result["merged"] if result else 0
+    if merged > 0:
+        logger.info("[Dedup] Merged %d case-insensitive duplicate Skill nodes", merged)
 
 
 # ── 5. GitHub questions → linked to every company's matching round ────────────
@@ -454,9 +643,13 @@ def _load_github_questions(session) -> None:
         "data/processed/github_ds_questions.json": "Data Scientist",
         "data/processed/github_de_questions.json": "Data Engineer",
     }
-    total   = 0
-    linked  = 0
-    skipped = 0
+
+    # ── Phase 1: Collect all data in Python ───────────────────────────────
+    q_batch: list[dict] = []            # question nodes
+    skill_links: list[dict] = []        # question → skill TESTS
+    level_links: list[dict] = []        # question → level FOR_LEVEL
+    round_links: list[dict] = []        # round → question CONTAINS
+    total = 0
 
     for path, default_role in files.items():
         if not os.path.exists(path):
@@ -472,60 +665,102 @@ def _load_github_questions(session) -> None:
             role  = q.get("role", default_role)
             topic = q.get("topic", "General")
 
-            session.run(
-                """
-                MERGE (iq:InterviewQuestion {id: $id})
-                  ON CREATE SET iq.text       = $text,
-                                iq.difficulty = $diff,
-                                iq.round_name = $rname,
-                                iq.source     = $src,
-                                iq.role       = $role,
-                                iq.topic      = $topic
-                """,
-                id=q_id, text=q["text"], diff=q.get("difficulty", "Medium"),
-                rname=q.get("round", "Technical Screen"),
-                src=q.get("source", "github"), role=role, topic=topic,
-            )
+            q_batch.append({
+                "id": q_id,
+                "text": q["text"],
+                "diff": q.get("difficulty", "Medium"),
+                "rname": q.get("round", "Technical Screen"),
+                "src": q.get("source", "github"),
+                "role": role,
+                "topic": topic,
+            })
 
             for sk in q.get("skills_tested", []):
-                session.run("MERGE (s:Skill {name: $s})", s=sk)
-                session.run(
-                    """
-                    MATCH (iq:InterviewQuestion {id: $qid}), (s:Skill {name: $s})
-                    MERGE (iq)-[:TESTS]->(s)
-                    """,
-                    qid=q_id, s=sk,
-                )
+                skill_links.append({"qid": q_id, "skill": sk})
 
-            # Map difficulty to experience level
             level = DIFFICULTY_TO_LEVEL.get(q.get("difficulty", "Medium"), "Mid")
-            session.run(
-                """
-                MATCH (iq:InterviewQuestion {id: $qid}), (el:ExperienceLevel {level: $lv})
-                MERGE (iq)-[:FOR_LEVEL]->(el)
-                """,
-                qid=q_id, lv=level,
-            )
+            level_links.append({"qid": q_id, "level": level})
 
-            # Link question to matching round in every company
+            # Pre-compute round IDs for all companies
             round_suffix = TOPIC_TO_ROUND.get(topic, "Technical Screen")
             for company in COMPANIES:
                 round_id = f"{company}_{slug}_{round_suffix}".replace(" ", "_")
-                result = session.run(
-                    """
-                    MATCH (ir:InterviewRound {id: $rid}), (iq:InterviewQuestion {id: $qid})
-                    MERGE (ir)-[:CONTAINS]->(iq)
-                    RETURN count(*) AS c
-                    """,
-                    rid=round_id, qid=q_id,
-                ).single()
-                if result and result["c"] > 0:
-                    linked += 1
-                else:
-                    skipped += 1
+                round_links.append({"rid": round_id, "qid": q_id})
 
             total += 1
 
+    if not q_batch:
+        logger.info("[GitHub Qs] No question files found")
+        return
+
+    logger.info("[GitHub Qs] Collected %d questions. Loading in batches...", total)
+
+    # ── Phase 2: Batch create question nodes ──────────────────────────────
+    for i in range(0, len(q_batch), BATCH_SIZE):
+        batch = q_batch[i : i + BATCH_SIZE]
+        session.run(
+            """
+            UNWIND $batch AS q
+            MERGE (iq:InterviewQuestion {id: q.id})
+              ON CREATE SET iq.text       = q.text,
+                            iq.difficulty = q.diff,
+                            iq.round_name = q.rname,
+                            iq.source     = q.src,
+                            iq.role       = q.role,
+                            iq.topic      = q.topic
+            """,
+            batch=batch,
+        )
+
+    # ── Phase 3: Batch create skill nodes + TESTS links ──────────────────
+    # First ensure all skills exist
+    unique_skills = list({sl["skill"] for sl in skill_links})
+    for i in range(0, len(unique_skills), BATCH_SIZE):
+        batch = unique_skills[i : i + BATCH_SIZE]
+        session.run("UNWIND $names AS n MERGE (s:Skill {name: n})", names=batch)
+
+    # Then batch link questions to skills
+    for i in range(0, len(skill_links), BATCH_SIZE):
+        batch = skill_links[i : i + BATCH_SIZE]
+        session.run(
+            """
+            UNWIND $batch AS sl
+            MATCH (iq:InterviewQuestion {id: sl.qid}), (s:Skill {name: sl.skill})
+            MERGE (iq)-[:TESTS]->(s)
+            """,
+            batch=batch,
+        )
+
+    # ── Phase 4: Batch link to experience levels ─────────────────────────
+    for i in range(0, len(level_links), BATCH_SIZE):
+        batch = level_links[i : i + BATCH_SIZE]
+        session.run(
+            """
+            UNWIND $batch AS ll
+            MATCH (iq:InterviewQuestion {id: ll.qid}), (el:ExperienceLevel {level: ll.level})
+            MERGE (iq)-[:FOR_LEVEL]->(el)
+            """,
+            batch=batch,
+        )
+
+    # ── Phase 5: Batch link to company rounds ────────────────────────────
+    linked = 0
+    for i in range(0, len(round_links), BATCH_SIZE):
+        batch = round_links[i : i + BATCH_SIZE]
+        result = session.run(
+            """
+            UNWIND $batch AS rl
+            OPTIONAL MATCH (ir:InterviewRound {id: rl.rid})
+            WITH rl, ir WHERE ir IS NOT NULL
+            MATCH (iq:InterviewQuestion {id: rl.qid})
+            MERGE (ir)-[:CONTAINS]->(iq)
+            RETURN count(*) AS c
+            """,
+            batch=batch,
+        ).single()
+        linked += result["c"] if result else 0
+
+    skipped = len(round_links) - linked
     logger.info(
         "[GitHub Qs] %d questions, %d company-round links, %d skipped (no matching round)",
         total, linked, skipped,
@@ -568,6 +803,15 @@ def load_all(driver: Driver) -> None:
         _load_leetcode(session)
         _load_job_market_skills(session)
         _load_github_questions(session)
+        _load_resources(session)
+
+    # Graph-native classification — runs AFTER all data is loaded
+    # so Cypher can use cross-company frequency and co-occurrence
+    with driver.session() as session:
+        _classify_kaggle_skills(session)
+
+    # Re-link resources after dedup (dedup may delete Skill nodes that had HAS_RESOURCE)
+    with driver.session() as session:
         _load_resources(session)
 
     with driver.session() as session:
