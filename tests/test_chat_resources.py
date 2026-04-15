@@ -24,7 +24,7 @@ class TestIntentDetection:
         ("What questions are asked at Meta?", "questions"),
         ("Compare Google and Amazon for Data Scientist", "compare"),
         ("What is the difference between Meta and Apple?", "compare"),
-        ("How should I prepare for the SQL round?", "resources"),
+        ("How should I study and prepare for SQL?", "resources"),
         ("What courses should I take to learn Python?", "resources"),
         ("Tell me about Google Data Scientist interviews", "overview"),
     ])

@@ -236,6 +236,14 @@ class TestSkillNormalization:
         assert _normalize_skill_name("A/B Testing") == "A/B Testing"
         assert _normalize_skill_name("Power BI") == "Power BI"
 
+    def test_normalizes_case(self):
+        """Prevents duplicates like 'leadership principles' vs 'Leadership Principles'."""
+        assert _normalize_skill_name("leadership principles") == "Leadership Principles"
+        assert _normalize_skill_name("machine learning") == "Machine Learning"
+        assert _normalize_skill_name("sql") == "SQL"
+        assert _normalize_skill_name("aws") == "AWS"
+        assert _normalize_skill_name("power bi") == "Power BI"
+
     def test_noise_set_is_lowercase(self):
         for entry in NOISE_SKILLS:
             assert entry == entry.lower(), f"Noise entry '{entry}' should be lowercase"
