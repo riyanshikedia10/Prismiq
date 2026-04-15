@@ -177,6 +177,8 @@ def _normalize_skill_name(raw: str) -> str | None:
     """
     Normalize a raw skill string from Kaggle data.
     Returns None if the skill should be skipped (noise/invalid).
+    Applies title-case normalization to prevent duplicates like
+    'Leadership Principles' vs 'leadership principles'.
     """
     name = raw.strip()
     if not name:
@@ -189,7 +191,21 @@ def _normalize_skill_name(raw: str) -> str | None:
     # Allow single uppercase letters (R, C) but reject lowercase single chars
     if len(name) == 1 and not name.isupper():
         return None
-    return name
+    # Normalize casing: title case, but preserve known acronyms and compounds
+    _ACRONYMS = {"sql", "aws", "gcp", "etl", "api", "ci", "cd", "ml",
+                 "ai", "nlp", "sas", "cdc", "bi", "iot", "llm"}
+    words = name.split()
+    normalized = []
+    for w in words:
+        if w.lower() in _ACRONYMS:
+            normalized.append(w.upper())
+        elif "/" in w or w.isupper() and len(w) > 1:
+            normalized.append(w)  # keep A/B, HTTP, etc. as-is
+        elif w.startswith("("):
+            normalized.append(w)
+        else:
+            normalized.append(w.capitalize())
+    return " ".join(normalized)
 
 # Topic to round name mapping (must match seed round names exactly)
 TOPIC_TO_ROUND: dict[str, str] = {
@@ -548,41 +564,33 @@ def _classify_kaggle_skills(session) -> None:
     """
     Graph-native skill classification using Cypher.
     Runs AFTER all data is loaded so the graph structure drives importance.
-
-    Logic:
-      - Skills in CRITICAL_BY_COMPANY_ROLE → already 'Critical' (from seeds)
-      - Kaggle skills appearing across 3+ companies for a role → 'High'
-      - Kaggle skills with frequency >= 50 → 'High'
-      - Everything else stays 'Medium'
-
-    This replaces the old hardcoded allowlist with graph-driven intelligence.
+    Promotes skills based on cross-company frequency regardless of source.
     """
-    # Promote high-frequency Kaggle skills on Company-level NEEDS
+    # Promote skills appearing across 3+ companies (any source) to High
     result = session.run(
         """
         MATCH (c:Company)-[n:NEEDS]->(s:Skill)
-        WHERE n.source = 'kaggle' AND n.importance = 'Medium'
-        WITH s, n, count(DISTINCT c) AS company_count
+        WHERE n.importance = 'Medium'
+        WITH s, collect(n) AS rels, count(DISTINCT c) AS company_count
         WHERE company_count >= 3
-        SET n.importance = 'High'
-        RETURN count(n) AS promoted
+        FOREACH (r IN rels | SET r.importance = 'High')
+        RETURN size(rels) AS promoted
         """
     ).single()
     promoted_cross = result["promoted"] if result else 0
 
-    # Promote by raw frequency on Role-level NEEDS
+    # Tag high-frequency Kaggle skills as Technical
     result = session.run(
         """
         MATCH (r:Role)-[n:NEEDS]->(s:Skill)
-        WHERE n.source = 'kaggle' AND n.frequency >= 50
+        WHERE n.frequency >= 50
         SET s.category = 'Technical'
         RETURN count(n) AS tagged
         """
     ).single()
     tagged_technical = result["tagged"] if result else 0
 
-    # Tag skills that ONLY appear in Kaggle (not in seeds) with low frequency
-    # as 'Supplementary' category so the UI can filter if needed
+    # Tag low-frequency Kaggle-only skills as Supplementary
     result = session.run(
         """
         MATCH (s:Skill)
@@ -600,6 +608,32 @@ def _classify_kaggle_skills(session) -> None:
         "%d tagged Technical (freq>=50), %d tagged Supplementary (freq<10)",
         promoted_cross, tagged_technical, supplementary,
     )
+
+    # Merge case-insensitive duplicates: keep the title-case version,
+    # re-link all relationships from the duplicate to the canonical node
+    result = session.run(
+        """
+        MATCH (s:Skill)
+        WITH toLower(s.name) AS key, collect(s) AS dupes
+        WHERE size(dupes) > 1
+        WITH dupes, head(dupes) AS keep
+        UNWIND tail(dupes) AS remove
+        OPTIONAL MATCH (remove)<-[r_in]-()
+        OPTIONAL MATCH (remove)-[r_out]->()
+        WITH keep, remove, collect(DISTINCT r_in) AS ins, collect(DISTINCT r_out) AS outs
+        FOREACH (r IN ins |
+            DELETE r
+        )
+        FOREACH (r IN outs |
+            DELETE r
+        )
+        DETACH DELETE remove
+        RETURN count(remove) AS merged
+        """
+    ).single()
+    merged = result["merged"] if result else 0
+    if merged > 0:
+        logger.info("[Dedup] Merged %d case-insensitive duplicate Skill nodes", merged)
 
 
 # ── 5. GitHub questions → linked to every company's matching round ────────────
@@ -775,6 +809,10 @@ def load_all(driver: Driver) -> None:
     # so Cypher can use cross-company frequency and co-occurrence
     with driver.session() as session:
         _classify_kaggle_skills(session)
+
+    # Re-link resources after dedup (dedup may delete Skill nodes that had HAS_RESOURCE)
+    with driver.session() as session:
+        _load_resources(session)
 
     with driver.session() as session:
         nodes = session.run("MATCH (n) RETURN count(n) AS c").single()["c"]
